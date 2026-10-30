@@ -242,14 +242,19 @@ jobs:
           NSP_DIR="$RUNNER_TEMP/nsp"
           KEYS_FILE="$RUNNER_TEMP/keys/prod.keys"
 
-          ARGS=("$NSP_DIR" -k "$KEYS_FILE" --progress lines --no-keep-extracted)
+          ARGS=("$NSP_DIR" -k "$KEYS_FILE" --progress lines)
+
+          if [ "$INPUT_ROMFS_MODE" = "separate" ]; then
+            ARGS+=(--romfs separate --keep-extracted)
+          else
+            ARGS+=(--romfs bundle --no-keep-extracted)
+          fi
 
           [ -n "$INPUT_PACKAGE" ] && ARGS+=(-p "$INPUT_PACKAGE")
           [ -n "$INPUT_APP_NAME" ] && ARGS+=(--app-name "$INPUT_APP_NAME")
           [ -n "$INPUT_BUNDLE_ID" ] && ARGS+=(--bundle-id "$INPUT_BUNDLE_ID")
           [ -n "$INPUT_LANGUAGE" ] && ARGS+=(-l "$INPUT_LANGUAGE")
           [ -n "$INPUT_GPU" ] && ARGS+=(--gpu "$INPUT_GPU")
-          [ "$INPUT_ROMFS_MODE" = "separate" ] && ARGS+=(--romfs separate)
           [ "$INPUT_SHOW_FPS" = "false" ] && ARGS+=(--no-show-fps)
           [ "$INPUT_ALLOW_OTHER_METAL" = "true" ] && ARGS+=(--allow-other-metal)
           [ "$INPUT_ALLOW_DAMAGED" = "true" ] && ARGS+=(--allow-damaged)
@@ -257,7 +262,9 @@ jobs:
           echo "Running build_ipa_from_nsp.py with args: ${ARGS[*]}"
           python3 scripts/build_ipa_from_nsp.py "${ARGS[@]}"
 
-          find "$NSP_DIR" -maxdepth 2 -type f \( -name "*.ipa" -o -name "romfs.img" \) -exec cp {} "$RUNNER_TEMP/dist/" \;
+          # Find generated IPA and separate RomFS.img if present
+          find "$NSP_DIR" -maxdepth 1 -type f -name "*.ipa" -exec cp {} "$RUNNER_TEMP/dist/" \;
+          find "$NSP_DIR" -type f -iname "romfs.img" -exec cp {} "$RUNNER_TEMP/dist/" \;
 
           if ! ls "$RUNNER_TEMP/dist"/*.ipa 1> /dev/null 2>&1; then
             echo "::error::build_ipa_from_nsp.py completed without generating an .ipa file in $NSP_DIR"
