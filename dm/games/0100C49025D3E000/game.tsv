@@ -18,7 +18,7 @@ shader_versions	v393216
 # ---- Files ----
 # every module main imports from (the renderer NRO is loaded at run time, nro_collect.py)
 modules	main sdk
-romfs_marker	Data/NX/superbundlelayout/installpackage_05/cas_01.cas
+romfs_marker	Data/NX/superbundlelayout/installpackage_00/cas_01.cas
 zip_store	.cas:.nrs:.metallib
 
 # ---- Memory ----
