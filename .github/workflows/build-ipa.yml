@@ -1,0 +1,300 @@
+# Build an unsigned iOS IPA for iPhone and iPad:
+# - Full game IPA straight from game packages (NSP / NSZ / XCI) and prod.keys via scripts/build_ipa_from_nsp.py.
+# - Synthetic smoke fixture IPA when run without packages or with synthetic_fixture=true, validating the complete
+#   Swift launcher, embedded modules, and packaging toolchain (dm/ios/tools/build_smoke.py and pack_ipa.py).
+name: build-ipa
+
+on:
+  workflow_dispatch:
+    inputs:
+      nsp_url:
+        description: 'URL(s) to download NSP / NSZ / XCI files (direct link, one per line or space-separated; leave empty for synthetic smoke IPA)'
+        required: false
+        type: string
+      keys_url:
+        description: 'Direct download URL to prod.keys (optional if PROD_KEYS secret is set)'
+        required: false
+        type: string
+      keys_base64:
+        description: 'Base64-encoded prod.keys content (optional if PROD_KEYS secret or keys_url is set)'
+        required: false
+        type: string
+      package:
+        description: 'Version package to pack into IPA, e.g. v0 or v327680 (leave empty for latest version)'
+        required: false
+        type: string
+      romfs_mode:
+        description: 'RomFS mode: bundle (game files inside IPA) or separate (separate romfs.img pushed later via scripts/push_romfs.sh)'
+        required: true
+        default: 'bundle'
+        type: choice
+        options:
+          - bundle
+          - separate
+      game:
+        description: 'Game Title ID (e.g. 010015100B514000). Optional; detected automatically from NSP when empty.'
+        required: false
+        type: string
+      app_name:
+        description: 'Custom display name for the app (optional; default from game control data)'
+        required: false
+        type: string
+      bundle_id:
+        description: 'Custom iOS bundle ID (optional; default: org.nxnative.<title_id>)'
+        required: false
+        type: string
+      language:
+        description: 'Game language code or name (e.g. en-US, ja, fr, de, es, zh-Hans). Optional.'
+        required: false
+        type: string
+      gpu:
+        description: 'Offline pipeline base GPU architecture for NVN games (e.g. g18p, none). Optional.'
+        required: false
+        type: string
+      show_fps:
+        description: 'Show frame rate counter on screen'
+        required: true
+        default: true
+        type: boolean
+      allow_other_metal:
+        description: "Allow building shaders with runner's Metal compiler even if it differs from lock"
+        required: true
+        default: true
+        type: boolean
+      allow_damaged:
+        description: 'Allow damaged NSP files that fail hash checks'
+        required: false
+        default: false
+        type: boolean
+      synthetic_fixture:
+        description: 'Build synthetic smoke fixture IPA without game files'
+        required: false
+        default: false
+        type: boolean
+      create_release:
+        description: 'Create a draft GitHub Release with the built IPA attached'
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: build-ipa-${{ github.ref }}-${{ github.run_id }}
+  cancel-in-progress: true
+
+env:
+  DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
+  INPUT_NSP_URL: ${{ inputs.nsp_url }}
+  INPUT_KEYS_URL: ${{ inputs.keys_url }}
+  INPUT_KEYS_BASE64: ${{ inputs.keys_base64 }}
+  INPUT_PACKAGE: ${{ inputs.package }}
+  INPUT_ROMFS_MODE: ${{ inputs.romfs_mode }}
+  INPUT_GAME: ${{ inputs.game }}
+  INPUT_APP_NAME: ${{ inputs.app_name }}
+  INPUT_BUNDLE_ID: ${{ inputs.bundle_id }}
+  INPUT_LANGUAGE: ${{ inputs.language }}
+  INPUT_GPU: ${{ inputs.gpu }}
+  INPUT_SHOW_FPS: ${{ inputs.show_fps }}
+  INPUT_ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
+  INPUT_ALLOW_DAMAGED: ${{ inputs.allow_damaged }}
+  INPUT_SYNTHETIC_FIXTURE: ${{ inputs.synthetic_fixture }}
+  INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
+  SECRET_PROD_KEYS: ${{ secrets.PROD_KEYS }}
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build-ipa:
+    name: Build unsigned iOS IPA
+    runs-on: xcode-27
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Select Xcode toolchain
+        run: |
+          if [ -d "$DEVELOPER_DIR" ]; then
+            echo "Using Xcode at $DEVELOPER_DIR"
+          elif [ -d "/Applications/Xcode.app/Contents/Developer" ]; then
+            export DEVELOPER_DIR="/Applications/Xcode.app/Contents/Developer"
+            echo "DEVELOPER_DIR fallback to $DEVELOPER_DIR"
+            echo "DEVELOPER_DIR=$DEVELOPER_DIR" >> "$GITHUB_ENV"
+          fi
+          xcodebuild -version
+          xcrun metal --version
+
+      - uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7.1.0
+        with:
+          python-version: '3.14'
+
+      - uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+        with:
+          dotnet-version: '10.0.x'
+
+      - name: Install build tools and dependencies
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: 1
+        run: |
+          command -v xcodegen || brew install xcodegen
+          command -v zstd || brew install zstd
+          command -v spirv-val || brew install spirv-tools
+          python -m pip install --upgrade pip
+          python -m pip install lz4 "capstone>=5,<6" fonttools nsz
+
+      - name: Prepare prod.keys
+        run: |
+          mkdir -p "$RUNNER_TEMP/keys"
+          KEYS_PATH="$RUNNER_TEMP/keys/prod.keys"
+          if [ -n "$SECRET_PROD_KEYS" ]; then
+            if echo "$SECRET_PROD_KEYS" | base64 -d > "$KEYS_PATH" 2>/dev/null && [ -s "$KEYS_PATH" ]; then
+              echo "Loaded prod.keys from base64 secret."
+            else
+              echo "$SECRET_PROD_KEYS" > "$KEYS_PATH"
+              echo "Loaded prod.keys from plaintext secret."
+            fi
+          elif [ -n "$INPUT_KEYS_BASE64" ]; then
+            echo "$INPUT_KEYS_BASE64" | base64 -d > "$KEYS_PATH" 2>/dev/null || echo "$INPUT_KEYS_BASE64" > "$KEYS_PATH"
+            echo "Loaded prod.keys from keys_base64 input."
+          elif [ -n "$INPUT_KEYS_URL" ]; then
+            curl -sSfL "$INPUT_KEYS_URL" -o "$KEYS_PATH"
+            echo "Downloaded prod.keys from keys_url."
+          fi
+
+          if [ -f "$KEYS_PATH" ] && [ -s "$KEYS_PATH" ]; then
+            chmod 600 "$KEYS_PATH"
+            echo "PROD_KEYS_READY=true" >> "$GITHUB_ENV"
+          else
+            echo "PROD_KEYS_READY=false" >> "$GITHUB_ENV"
+          fi
+
+      - name: Prepare game packages
+        run: |
+          mkdir -p "$RUNNER_TEMP/nsp"
+          if [ -n "$INPUT_NSP_URL" ]; then
+            echo "Downloading game packages from URL(s)..."
+            while IFS= read -r url || [ -n "$url" ]; do
+              url=$(echo "$url" | tr -d '\r' | xargs)
+              [ -z "$url" ] && continue
+              echo "Downloading: ${url%%\?*}"
+              curl -fL --retry 3 --retry-delay 5 -O -J "$url" --output-dir "$RUNNER_TEMP/nsp" || \
+              curl -fL --retry 3 --retry-delay 5 "$url" -o "$RUNNER_TEMP/nsp/game_$(date +%s%N).nsp"
+            done <<< "$INPUT_NSP_URL"
+          fi
+          PKG_COUNT=$(find "$RUNNER_TEMP/nsp" -type f \( -name "*.nsp" -o -name "*.nsz" -o -name "*.xci" -o -name "*.xcz" \) | wc -l | xargs)
+          echo "Found $PKG_COUNT package file(s)."
+          echo "PKG_COUNT=$PKG_COUNT" >> "$GITHUB_ENV"
+
+      - name: Determine build mode
+        run: |
+          if [ "$INPUT_SYNTHETIC_FIXTURE" = "true" ] || [ "$PKG_COUNT" -eq 0 ]; then
+            if [ "$INPUT_SYNTHETIC_FIXTURE" != "true" ] && [ -n "$INPUT_NSP_URL" ]; then
+              echo "::error::No package files (.nsp, .nsz, .xci, .xcz) found from the provided download URL(s)."
+              exit 1
+            fi
+            echo "BUILD_MODE=synthetic" >> "$GITHUB_ENV"
+            echo "Selected build mode: synthetic smoke/fixture IPA."
+          else
+            if [ "$PROD_KEYS_READY" != "true" ]; then
+              echo "::error::Game packages were provided, but prod.keys is missing. Configure repository secret PROD_KEYS or provide keys_url/keys_base64 in the workflow dispatch inputs."
+              exit 1
+            fi
+            echo "BUILD_MODE=game" >> "$GITHUB_ENV"
+            echo "Selected build mode: game IPA from package files."
+          fi
+
+      - name: Build synthetic smoke fixture IPA
+        if: env.BUILD_MODE == 'synthetic'
+        run: |
+          echo "Building synthetic iOS app fixture..."
+          SMOKE_DIR="$RUNNER_TEMP/ios-smoke"
+          GAME_ID="${INPUT_GAME:-010015100B514000}"
+          GAME="$GAME_ID" python3 dm/ios/tools/build_smoke.py --output "$SMOKE_DIR"
+
+          APP="$SMOKE_DIR/derived/Build/Products/Release-iphoneos/DmIOS.app"
+          [ -d "$APP" ] || { echo "::error::Smoke app was not created at $APP"; exit 1; }
+
+          mkdir -p "$RUNNER_TEMP/dist"
+          ENT="$RUNNER_TEMP/dist/DmIOS.entitlements"
+          printf '%s\n' '<?xml version="1.0" encoding="UTF-8"?>' '<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">' \
+            '<plist version="1.0"><dict><key>com.apple.developer.kernel.increased-memory-limit</key><true/></dict></plist>' > "$ENT"
+
+          EXE="$APP/DmIOS"
+          if [ -f "$EXE" ]; then
+            xattr -cr "$EXE" 2>/dev/null || true
+            codesign --force --sign - --entitlements "$ENT" "$EXE" 2>/dev/null || true
+          fi
+
+          OUT_IPA="$RUNNER_TEMP/dist/nxnative-smoke.ipa"
+          echo "Packing synthetic IPA to $OUT_IPA..."
+          python3 dm/ios/tools/pack_ipa.py "$OUT_IPA" "Payload/DmIOS.app=$APP"
+          echo "Smoke IPA generated at $OUT_IPA ($(du -h "$OUT_IPA" | cut -f1))"
+
+      - name: Build game IPA from package
+        if: env.BUILD_MODE == 'game'
+        run: |
+          mkdir -p "$RUNNER_TEMP/dist"
+          NSP_DIR="$RUNNER_TEMP/nsp"
+          KEYS_FILE="$RUNNER_TEMP/keys/prod.keys"
+
+          ARGS=("$NSP_DIR" -k "$KEYS_FILE" --progress lines --no-keep-extracted)
+
+          [ -n "$INPUT_PACKAGE" ] && ARGS+=(-p "$INPUT_PACKAGE")
+          [ -n "$INPUT_APP_NAME" ] && ARGS+=(--app-name "$INPUT_APP_NAME")
+          [ -n "$INPUT_BUNDLE_ID" ] && ARGS+=(--bundle-id "$INPUT_BUNDLE_ID")
+          [ -n "$INPUT_LANGUAGE" ] && ARGS+=(-l "$INPUT_LANGUAGE")
+          [ -n "$INPUT_GPU" ] && ARGS+=(--gpu "$INPUT_GPU")
+          [ "$INPUT_ROMFS_MODE" = "separate" ] && ARGS+=(--romfs separate)
+          [ "$INPUT_SHOW_FPS" = "false" ] && ARGS+=(--no-show-fps)
+          [ "$INPUT_ALLOW_OTHER_METAL" = "true" ] && ARGS+=(--allow-other-metal)
+          [ "$INPUT_ALLOW_DAMAGED" = "true" ] && ARGS+=(--allow-damaged)
+
+          echo "Running build_ipa_from_nsp.py with args: ${ARGS[*]}"
+          python3 scripts/build_ipa_from_nsp.py "${ARGS[@]}"
+
+          find "$NSP_DIR" -maxdepth 2 -type f \( -name "*.ipa" -o -name "romfs.img" \) -exec cp {} "$RUNNER_TEMP/dist/" \;
+
+          if ! ls "$RUNNER_TEMP/dist"/*.ipa 1> /dev/null 2>&1; then
+            echo "::error::build_ipa_from_nsp.py completed without generating an .ipa file in $NSP_DIR"
+            exit 1
+          fi
+          echo "Built game package products:"
+          ls -lh "$RUNNER_TEMP/dist"
+
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ env.BUILD_MODE == 'game' && 'game-ipa' || 'smoke-ipa' }}
+          path: ${{ runner.temp }}/dist/*
+          retention-days: 14
+
+      - name: Collect build logs
+        if: failure()
+        run: |
+          mkdir -p "$RUNNER_TEMP/failure_logs"
+          find "$RUNNER_TEMP" -type f -name "*.log" -exec cp {} "$RUNNER_TEMP/failure_logs/" \; 2>/dev/null || true
+          [ -d "logs" ] && cp -r logs/* "$RUNNER_TEMP/failure_logs/" 2>/dev/null || true
+
+      - name: Upload failure logs
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ipa-build-logs
+          path: ${{ runner.temp }}/failure_logs/*
+          retention-days: 7
+
+      - name: Create draft release
+        if: success() && inputs.create_release == true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="ipa-$(date +%Y%m%d-%H%M%S)"
+          TITLE="IPA Build $TAG"
+          NOTES="Unsigned iOS IPA build (${BUILD_MODE}) generated by GitHub Actions."
+          gh release create "$TAG" "$RUNNER_TEMP/dist"/* --title "$TITLE" --notes "$NOTES" --draft
+
