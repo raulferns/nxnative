@@ -8,7 +8,11 @@ on:
   workflow_dispatch:
     inputs:
       nsp_url:
-        description: 'URL(s) to download NSP / NSZ / XCI files (direct link, one per line or space-separated; leave empty for synthetic smoke IPA)'
+        description: 'Primary URL to download NSP / NSZ / XCI package (base game; direct link, or space/newline-separated URLs; leave empty for synthetic smoke IPA)'
+        required: false
+        type: string
+      nsp_url_2:
+        description: 'Second URL to download NSP / NSZ / XCI package (game update, DLC, or second package; optional)'
         required: false
         type: string
       keys_url:
@@ -87,6 +91,7 @@ concurrency:
 env:
   DEVELOPER_DIR: /Applications/Xcode_27.1.app/Contents/Developer
   INPUT_NSP_URL: ${{ inputs.nsp_url }}
+  INPUT_NSP_URL_2: ${{ inputs.nsp_url_2 }}
   INPUT_KEYS_URL: ${{ inputs.keys_url }}
   INPUT_KEYS_BASE64: ${{ inputs.keys_base64 }}
   INPUT_PACKAGE: ${{ inputs.package }}
@@ -193,16 +198,33 @@ jobs:
       - name: Prepare game packages
         run: |
           mkdir -p "$RUNNER_TEMP/nsp"
-          if [ -n "$INPUT_NSP_URL" ]; then
+          if [ -n "$INPUT_NSP_URL" ] || [ -n "$INPUT_NSP_URL_2" ]; then
             echo "Downloading game packages from URL(s)..."
-            while IFS= read -r url || [ -n "$url" ]; do
-              url=$(echo "$url" | tr -d '\r' | xargs)
+            set -f
+            for token in $INPUT_NSP_URL $INPUT_NSP_URL_2; do
+              url=$(echo "$token" | tr -d '\r"' | xargs)
               [ -z "$url" ] && continue
               echo "Downloading: ${url%%\?*}"
               curl -fL --retry 3 --retry-delay 5 -O -J "$url" --output-dir "$RUNNER_TEMP/nsp" || \
               curl -fL --retry 3 --retry-delay 5 "$url" -o "$RUNNER_TEMP/nsp/game_$(date +%s%N).nsp"
-            done <<< "$INPUT_NSP_URL"
+            done
+            set +f
           fi
+
+          # If any downloaded package file lacks an extension, give it .nsp so tools recognize it
+          for f in "$RUNNER_TEMP/nsp"/*; do
+            [ -f "$f" ] || continue
+            case "$f" in
+              *.nsp|*.nsz|*.xci|*.xcz) ;;
+              *)
+                if head -c 4 "$f" 2>/dev/null | grep -q "PFS0"; then
+                  mv "$f" "${f}.nsp"
+                  echo "Renamed $(basename "$f") -> $(basename "$f").nsp"
+                fi
+                ;;
+            esac
+          done
+
           PKG_COUNT=$(find "$RUNNER_TEMP/nsp" -type f \( -name "*.nsp" -o -name "*.nsz" -o -name "*.xci" -o -name "*.xcz" \) | wc -l | xargs)
           echo "Found $PKG_COUNT package file(s)."
           echo "PKG_COUNT=$PKG_COUNT" >> "$GITHUB_ENV"
@@ -210,7 +232,7 @@ jobs:
       - name: Determine build mode
         run: |
           if [ "$INPUT_SYNTHETIC_FIXTURE" = "true" ] || [ "$PKG_COUNT" -eq 0 ]; then
-            if [ "$INPUT_SYNTHETIC_FIXTURE" != "true" ] && [ -n "$INPUT_NSP_URL" ]; then
+            if [ "$INPUT_SYNTHETIC_FIXTURE" != "true" ] && ([ -n "$INPUT_NSP_URL" ] || [ -n "$INPUT_NSP_URL_2" ]); then
               echo "::error::No package files (.nsp, .nsz, .xci, .xcz) found from the provided download URL(s)."
               exit 1
             fi
