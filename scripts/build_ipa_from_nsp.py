@@ -531,6 +531,14 @@ def version_of(path):
 
 
 COMPRESSED = {'.nsz': '.nsp', '.xcz': '.xci'}   # nsz's compressed NSP / XCI and what nsz -D makes of them
+PACKAGE_SUFFIXES = ('.nsp', '.xci', '.nsz', '.xcz')
+
+
+def files_with_suffix(folder, *suffixes):
+    """The files of folder whose extension is one of suffixes in any letter case (`Game [id].NSP` from a download or a card dump): Path.glob('*.nsp') compares case-sensitively on every
+    POSIX system, a case-insensitive Mac volume included. An AppleDouble file does not count: on an exFAT / FAT drive macOS keeps a file's extended attributes (a download's quarantine
+    flag) in `._<name>`, one beside each game file"""
+    return sorted(p for p in folder.iterdir() if p.suffix.lower() in suffixes and not p.name.startswith('._') and p.is_file())
 
 
 def extract_flags(app):   # nx_extract's options shared by its extraction calls: the application to read (--app), the program of a multi-program application and a damaged NSP.
@@ -553,14 +561,14 @@ def scan_nsps(nsp_dir, from_package=None, contents_of=None, want=None):
         if low == 0: f['base'] = p
         elif low == 0x800: f['updates'].append((version, p))
         else: f['dlc'].append((tid, version, p))
-    for p in sorted([*nsp_dir.glob('*.nsp'), *nsp_dir.glob('*.xci'), *nsp_dir.glob('*.nsz'), *nsp_dir.glob('*.xcz')]):   # a base game may be a cartridge dump (.xci: Monster Hunter Rise); nx_extract reads its secure partition
-        if p.name.startswith('._'): continue   # an AppleDouble file: on an exFAT / FAT drive macOS keeps a file's extended attributes (a download's quarantine flag) in `._<name>`, one beside each game file; is_package would skip it too, with a line for each
+    packages = files_with_suffix(nsp_dir, *PACKAGE_SUFFIXES)   # a base game may be a cartridge dump (.xci: Monster Hunter Rise); nx_extract reads its secure partition
+    for p in packages:
         if p.stat().st_size == 0:   # an empty file left by an incomplete download (the Zelda BotW folder holds a 0-byte DLC NSP next to the complete (1).nsp)
             say(f'skipping an empty file: {p.name}'); continue
         if not is_package(p):   # title_of falls back to the name's [title ID]: without this, any file with a game's extension and tag counted as one of its packages
             say(f'skipping {p.name}: neither an NSP (PFS0) nor an XCI (HEAD at 0x100)'); continue
-        if p.suffix in COMPRESSED and p.with_suffix(COMPRESSED[p.suffix]).exists():
-            say(f'skipping {p.name}: {p.with_suffix(COMPRESSED[p.suffix]).name} is beside it'); continue
+        beside = next((q for q in packages if q.suffix.lower() == COMPRESSED.get(p.suffix.lower()) and q.stem.lower() == p.stem.lower()), None)   # from the listing: `Game.NSP` is beside `Game.nsz` on a case-sensitive volume too
+        if beside: say(f'skipping {p.name}: {beside.name} is beside it'); continue
         if contents_of and is_merged(p):
             cs = [(t, i, v) for t, i, v in contents_of(p) or () if t in ('Application', 'Patch', 'AddOnContent')]
             if cs:
@@ -609,12 +617,24 @@ def nsz_command(env):
     raise BuildError(f'NSZ / XCZ files need the nsz tool in the current Python ({sys.executable}: pip install nsz) or an nsz 5.0 or later executable on PATH ({" or ".join(NSZ_EXECUTABLES)}){detail}')
 
 
+def nsz_source(p, tmp):
+    """The path of p to give nsz -D. nsz takes only a lowercase extension (anything else it skips and exits 0 with no output) and resolves a symlink before looking, so a name in capitals
+    goes as a hard link with a lowercase extension in tmp, or as a copy where there can be none (another volume, exFAT). The limit is nsz's own, in its PathTools.isCompressedGame"""
+    src = p.resolve()
+    if p.suffix == p.suffix.lower(): return src
+    (tmp / 'source').mkdir()
+    lower = tmp / 'source' / (p.stem + p.suffix.lower())
+    try: os.link(src, lower)
+    except OSError: shutil.copyfile(src, lower)
+    return lower.resolve()
+
+
 def decompress_nsz(nsp_dir, app, fam, keys, env, work=None):
     """NSZ / XCZ files of fam converted once with nsz -D into <build folder>/nsp/ (work, the --work-dir folder, else <title ID>_build in the NSP folder); returns fam with the converted files in their place. nsz writes into an empty temporary folder
     and the file is moved into nsp/ only when nsz exits 0, so a partial one is never taken for a whole one; a conversion is reused while its source has the same name, size and
     modification time. nsz -D prints an NCA hash mismatch but goes on and exits 0: nx_extract's hash check catches a damaged file (ALLOW_DAMAGED)"""
     paths = [fam['base']] + [p for _, p in fam['updates']] + [p for _, _, p in fam['dlc']]
-    todo = list(dict.fromkeys(p for p in paths if p.suffix in COMPRESSED))   # a merged package is the base game, the update and DLC: converted once
+    todo = list(dict.fromkeys(p for p in paths if p.suffix.lower() in COMPRESSED))   # a merged package is the base game, the update and DLC: converted once
     if not todo: return fam
     nsz, keys_opt = nsz_command(env), []
     if nsz[0] != sys.executable: keys_opt = ['--keys', keys.resolve()]   # a standalone nsz looks for keys beside itself, not in cwd: it takes them by --keys (nsz_command)
@@ -622,7 +642,7 @@ def decompress_nsz(nsp_dir, app, fam, keys, env, work=None):
     PROG.plan(1); PROG.stage('decompress NSZ', done=0, total=len(todo))
     conv, made = {}, 0
     for i, p in enumerate(todo):
-        dst = out / (p.stem + COMPRESSED[p.suffix]); keyfile = dst.with_name(dst.name + '.key')
+        dst = out / (p.stem + COMPRESSED[p.suffix.lower()]); keyfile = dst.with_name(dst.name + '.key')
         st = p.stat(); key = fingerprint(p.name, st.st_size, st.st_mtime_ns)
         if not (dst.is_file() and reused(keyfile, key) is not None):
             PROG.set(done=i, step=p.name)
@@ -631,7 +651,7 @@ def decompress_nsz(nsp_dir, app, fam, keys, env, work=None):
             try:
                 # nsz 4.6.1 loads keys.txt beside argv[0] at import time; with argv[0] = 'nsz' that is cwd. That release has no --keys option.
                 (tmp / 'keys.txt').symlink_to(keys.resolve())
-                run([*nsz, *keys_opt, '-D', '-o', tmp, p.resolve()], log, env=env, cwd=tmp)
+                run([*nsz, *keys_opt, '-D', '-o', tmp, nsz_source(p, tmp)], log, env=env, cwd=tmp)
                 if not (tmp / dst.name).is_file(): raise BuildError(f'nsz made no {dst.name} (full output: {log})')
                 (tmp / dst.name).rename(dst)
             finally: rmtree(tmp)
@@ -1155,15 +1175,15 @@ def extract_html(nx, keys, dst, base, upd, logs, app):
 
 
 def dump_folder(folder):   # a folder of the game's files (pack_dump.py), with no game package beside them: NSPs in the folder are what the player asked for
-    return pack_dump.is_dump(folder) and not any(p for g in ('*.nsp', '*.xci', '*.nsz', '*.xcz') for p in folder.glob(g) if not p.name.startswith('._'))
+    return pack_dump.is_dump(folder) and not files_with_suffix(folder, *PACKAGE_SUFFIXES)
 
 
 def nup_file(path):   # the NUP to pack: path when it is a .nup file, else the one .nup in the folder when no game package is beside it; None when there is none
     if path.is_file():
         if not pack_nup.is_nup(path): raise BuildError(f'not a folder or a NUP file: {path}')
         return path
-    if any(p for g in ('*.nsp', '*.xci', '*.nsz', '*.xcz') for p in path.glob(g) if not p.name.startswith('._')): return None
-    nups = sorted(p for p in path.glob('*.nup') if not p.name.startswith('._') and pack_nup.is_nup(p))
+    if files_with_suffix(path, *PACKAGE_SUFFIXES): return None
+    nups = [p for p in files_with_suffix(path, '.nup') if pack_nup.is_nup(p)]
     if len(nups) > 1: raise BuildError(f'more than one NUP in {path}: {", ".join(p.name for p in nups)}; keep one game per folder, or give the .nup file to pack in place of the folder')
     return nups[0] if nups else None
 
@@ -1641,6 +1661,16 @@ def jit_stamp(patched, g):   # what captures depend on: the size of every rewrit
     return json.dumps({'modules': sizes, 'jit_key_data': g.get('jit_key_data', ''), 'jit_out_code': g.get('jit_out_code', ''), 'jit_route': g.get('jit_route', '')})
 
 
+def jit_boot_done(part):
+    """boot_mac's done() for a JIT capture into the folder part: the boot code (the largest request) and nothing new for 10 s"""
+    last = {'n': 0, 't': time.time()}
+    def done():
+        fs = list(part.glob('*.jit')); n = len(fs)
+        if n != last['n']: last['n'], last['t'] = n, time.time()
+        return bool(fs and max(f.stat().st_size for f in fs) > 1 << 20 and time.time() - last['t'] > 10)
+    return done
+
+
 def capture_jit(py, repo, d, patched, work, env, logs, g):
     """A game that generates code at run time through nn::jit (uses_jit): the iPhone runs no such code, so it serves the plugin's output from an image built here (dm/tools/jit_capture.py,
     hle_jit.c). The game boots twice in the Mac host (headless and silent) with DM_JIT_CAPTURE, each run into a folder of its own under <version dir>/jit_capture (boot1, boot2): two runs in
@@ -1666,12 +1696,7 @@ def capture_jit(py, repo, d, patched, work, env, logs, g):
         if name == 'route': henv['DM_KEYS'] = route
         PROG.set(step=f'booting the game ({name})')
         say(f'booting the game in the Mac host to capture the code its JIT plugin makes ({name}) → {c}')
-        last = {'n': 0, 't': time.time()}
-        def done():   # the boot code (the largest request) and nothing new for 10 s
-            fs = list(part.glob('*.jit')); n = len(fs)
-            if n != last['n']: last['n'], last['t'] = n, time.time()
-            return bool(fs and max(f.stat().st_size for f in fs) > 1 << 20 and time.time() - last['t'] > 10)
-        t0 = time.time(); rc = boot_mac(host, patched, henv, rd, log, *((JIT_ROUTE_SECS, lambda: False) if name == 'route' else (JIT_SECS, done)))
+        t0 = time.time(); rc = boot_mac(host, patched, henv, rd, log, *((JIT_ROUTE_SECS, lambda: False) if name == 'route' else (JIT_SECS, jit_boot_done(part))))
         if not any(f.stat().st_size > 1 << 20 for f in part.glob('*.jit')):
             if rc is not None: host_stopped(log, rc, time.time() - t0)
             raise BuildError(f'the JIT capture ({name}) holds no boot code (host output: {log})')

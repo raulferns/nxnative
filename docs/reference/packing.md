@@ -140,6 +140,13 @@
 - **Fix:** `dm/mac/pack_app.py` `detritus()` drops those names from `selected_inputs`, so neither the pack nor `DMModuleFiles` sees them. `copy()` passes `-X` where it copies and not where it clones (`cp` refuses the two together), and the host goes through `shutil.copy` instead of `copy2`, so a copy creates none of them. `strip_detritus()` runs before `codesign` reads the staged bundle, runs again after `xattr -cr` when `codesign` still refuses one, and runs once more after signing. On APFS nothing changes: no sidecar exists there, and the two passes are a stat walk. `dm/tools/tests/test_nsp_mac_app.py` puts a `._` file in every input folder and checks that it is not selected, does not reach the bundle, and is not in `DMModuleFiles`.
 - **Found on:** the NX2Apple fork's users, packing Mac apps on an external drive ([LNPANDY/NX2Apple#486](https://github.com/LNPANDY/NX2Apple/issues/486)); reproduced on an exFAT disk image made with `hdiutil create -fs ExFAT`, where the same inputs pack, sign and pass `codesign --verify --strict` with the change and stop three ways without it. Applies to every game's Mac app.
 
+### A second Mac app build stops with `[Errno 45]` when it replaces the old app
+
+- **Symptom:** with the app on a Mac OS Extended, exFAT or FAT drive, the first build into a folder works and the next one that changes anything stops in `pack_app.py` `replace_app` with `OSError: [Errno 45] Operation not supported: '<app>'`. The old app stays in place.
+- **Cause:** `replace_app` exchanges the new and the old app with `renamex_np(RENAME_SWAP)`, which only APFS offers: the others return `ENOTSUP`. A first build has no old app to exchange, so it takes a plain rename.
+- **Fix:** on `ENOTSUP` or `EOPNOTSUPP`, `swap_by_moves` makes the state the swap leaves with three renames (the old app to `<app>.old`, the new one to `<app>`, the old one to `<app>.partial`), so the key write and its rollback do not change. A rename that fails undoes the ones before it. These volumes cannot make it atomic: a process killed between the first two renames leaves no app at `<app>`, with the old one at `<app>.old` until the next replacement clears it. APFS still swaps. Tests: `dm/tools/tests/test_nsp_mac_app.py` `test_volume_without_atomic_swap_replaces_by_moves`, `test_fallback_restores_the_old_app_when_a_move_fails` and `test_fallback_clears_an_old_app_a_killed_build_left_aside`.
+- **Found on:** a user's rebuild onto an external Mac OS Extended (Journaled) drive ([LNPANDY/NX2Apple#595](https://github.com/LNPANDY/NX2Apple/issues/595), [PR #1190](https://github.com/seedds/nxnative/pull/1190)); reproduced on HFS+ and exFAT disk images made with `hdiutil create`, where the `PackReuse` tests stop with the real errno without the change and reach the fallback with it. Applies to every game's Mac app.
+
 ### External shader directories contain AppleDouble metadata
 
 - **Symptom:** on an exFAT or FAT drive, shader splitting stops with `ValueError: not a version 2 shader code archive` or `[RED] /glslc_capture/._…: no GLSLC output`.
@@ -181,6 +188,13 @@
 - **Cause:** `title_of` took the title ID only from the ticket's file name (`<rights ID>.tik`) or from a `[title ID]` tag in the package's file name. Many NSPs carry no ticket (standard-crypto dumps, repacks), and a download's file name often has no tag.
 - **Fix:** with neither, `title_of` asks the package: `nx_extract <prod.keys> --title <package>` opens it, decrypts the header of each meta NCA with the keys' `header_key` and prints the lowest title ID (the base game's before its update's or a DLC's). It works for NSP, NSZ (the meta NCA is not compressed), XCI and XCZ, and runs only when the ticket and the tag are both missing, so the common cases stay a read of the file name table. `nx_extract` is built into a temporary folder for it, since the build folder is named after the title ID. Key values are never printed.
 - **Found on:** NX2Apple, [LNPANDY/NX2Apple#177](https://github.com/LNPANDY/NX2Apple/issues/177) ([Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md), whose base NSP has no ticket). Applies to every game.
+
+### A game file whose extension is in capitals is not found
+
+- **Symptom:** `[RED] no NSP with a readable title ID in <folder>` for a folder holding `Game [0100XXXXXXXXXXXX].NSP`, on any Mac volume; renaming it to `.nsp` makes the build go on. A dump folder beside `Game.NSP` is packed instead of the package, and `Game.NUP` is not found. A `Game.NSZ` stops with `nsz made no Game.nsp`.
+- **Cause:** the script listed the folder with `Path.glob('*.nsp')`, which compares case-sensitively on every POSIX system, a case-insensitive Mac volume included. nsz has the same limit of its own: `PathTools.isCompressedGame` takes only a lowercase extension, and nsz skips anything else and exits 0 with no output. It resolves a symlink before it looks.
+- **Fix:** `files_with_suffix` lists a folder's files by their lowercased extension, for every scan of the inputs, and a package beside a compressed one is found in that listing. A compressed file in capitals goes to nsz as a hard link with a lowercase extension in its temporary folder, or as a copy where there can be none (another volume, exFAT), so the player's file stays as it is.
+- **Found on:** NX2Apple, [LNPANDY/NX2Apple#554](https://github.com/LNPANDY/NX2Apple/issues/554) ([Tears of the Kingdom](../../dm/games/0100F2C0115B6000/README.md)). Applies to every game.
 
 ### A merged NSP (base game, update and DLC in one file) packs as one title
 
