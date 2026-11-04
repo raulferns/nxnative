@@ -32,6 +32,10 @@ class Space(unittest.TestCase):
         base, u1, u2 = self.nsp('base.nsp', 100), self.nsp('u1.nsp', 5), self.nsp('u2.nsp', 6)
         self.assertEqual(nsp.extract_bytes({'v0': (base, None), 'v1': (base, u1), 'v2': (base, u2)}, False), 311)
 
+    def test_allow_low_disk_option(self):
+        args = nsp.parse_args(['--allow-low-disk', 'dummy_nsp_dir'])
+        self.assertTrue(args.allow_low_disk)
+
     def test_no_clone_source_without_v0(self):   # clones need the base game extracted alone first
         base, u1, u2 = self.nsp('base.nsp', 100), self.nsp('u1.nsp', 5), self.nsp('u2.nsp', 6)
         self.assertEqual(nsp.extract_bytes({'v1': (base, u1), 'v2': (base, u2)}, True), 211)

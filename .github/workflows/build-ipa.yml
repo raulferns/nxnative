@@ -70,6 +70,11 @@ on:
         required: false
         default: false
         type: boolean
+      allow_low_disk:
+        description: 'Allow building even if free disk space is less than estimated requirement'
+        required: false
+        default: true
+        type: boolean
       synthetic_fixture:
         description: 'Build synthetic smoke fixture IPA without game files'
         required: false
@@ -104,6 +109,7 @@ env:
   INPUT_SHOW_FPS: ${{ inputs.show_fps }}
   INPUT_ALLOW_OTHER_METAL: ${{ inputs.allow_other_metal }}
   INPUT_ALLOW_DAMAGED: ${{ inputs.allow_damaged }}
+  INPUT_ALLOW_LOW_DISK: ${{ inputs.allow_low_disk }}
   INPUT_SYNTHETIC_FIXTURE: ${{ inputs.synthetic_fixture }}
   INPUT_CREATE_RELEASE: ${{ inputs.create_release }}
   SECRET_PROD_KEYS: ${{ secrets.PROD_KEYS }}
@@ -138,6 +144,8 @@ jobs:
         run: |
           echo "Disk space before cleanup:"
           df -h /
+
+          echo "Removing unused Xcode apps..."
           ACTIVE_XCODE=$(dirname $(dirname "$DEVELOPER_DIR"))
           for app in /Applications/Xcode*.app; do
             if [ -d "$app" ] && [ "$app" != "$ACTIVE_XCODE" ]; then
@@ -145,8 +153,32 @@ jobs:
               sudo rm -rf "$app" 2>/dev/null || true
             fi
           done
+
+          echo "Removing Simulator runtimes..."
+          sudo rm -rf /Library/Developer/CoreSimulator/Profiles/Runtimes/* 2>/dev/null || true
+          sudo rm -rf /Library/Developer/CoreSimulator/Volumes/* 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Developer/CoreSimulator/Devices/* 2>/dev/null || true
+
+          echo "Removing Android SDK..."
+          sudo rm -rf /Users/runner/Library/Android 2>/dev/null || true
+          sudo rm -rf /usr/local/lib/android 2>/dev/null || true
+          sudo rm -rf /usr/local/share/android-sdk 2>/dev/null || true
+          sudo rm -rf /Library/Android 2>/dev/null || true
+
+          echo "Removing unused tool caches..."
+          sudo rm -rf /Users/runner/hostedtoolcache/Java* 2>/dev/null || true
+          sudo rm -rf /Users/runner/hostedtoolcache/CodeQL 2>/dev/null || true
+          sudo rm -rf /Users/runner/hostedtoolcache/go 2>/dev/null || true
+          sudo rm -rf /Users/runner/hostedtoolcache/PyPy 2>/dev/null || true
+          sudo rm -rf /Users/runner/hostedtoolcache/node 2>/dev/null || true
+
+          echo "Removing developer caches..."
           sudo rm -rf /Library/Developer/CommandLineTools 2>/dev/null || true
-          brew cleanup -s 2>/dev/null || true
+          sudo rm -rf /Library/Ruby 2>/dev/null || true
+          sudo rm -rf /Users/runner/.gem /Users/runner/.cocoapods 2>/dev/null || true
+          sudo rm -rf /Users/runner/Library/Caches/* /Library/Caches/* 2>/dev/null || true
+          brew cleanup -s --prune=all 2>/dev/null || true
+
           echo "Disk space after cleanup:"
           df -h /
 
@@ -297,6 +329,7 @@ jobs:
           [ "$INPUT_SHOW_FPS" = "false" ] && ARGS+=(--no-show-fps)
           [ "$INPUT_ALLOW_OTHER_METAL" = "true" ] && ARGS+=(--allow-other-metal)
           [ "$INPUT_ALLOW_DAMAGED" = "true" ] && ARGS+=(--allow-damaged)
+          [ "$INPUT_ALLOW_LOW_DISK" = "true" ] && ARGS+=(--allow-low-disk)
 
           # Background watcher: as soon as RomFS.img is written, delete downloaded packages to reclaim ~30+ GB
           (
