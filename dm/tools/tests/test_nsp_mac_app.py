@@ -58,7 +58,7 @@ class Copy(unittest.TestCase):
                 pack_app.copy(iter(srcs), dst, clone)
                 self.assertGreater(run.call_count, 1)
                 copied = []
-                flags = ['/bin/cp', '-R'] + (['-c'] if clone else [])
+                flags = ['/bin/cp', '-R'] + (['-c'] if clone else ['-X'])   # a clone keeps the attributes, a copy leaves them out (cp rejects -c -X)
                 for call in run.call_args_list:
                     cmd = call.args[0]
                     self.assertEqual(cmd[:len(flags)], flags); self.assertEqual(cmd[-1], dst)
@@ -272,6 +272,22 @@ class PackReuse(unittest.TestCase):
         self.assertFalse((dm / 'c1_full.tsv').exists())
         (self.tmp / 'patched/new.patched.bin').unlink(); (self.tmp / 'patched/new.fixups.tsv').unlink(); self.assert_repacked()
 
+    def test_finder_detritus_is_not_an_input_and_never_reaches_the_bundle(self):
+        # An exFAT build folder (an external drive) keeps a file's extended attributes in a "._name" file beside it: taken as an input they would be packed as a module or a
+        # shader, and left in the bundle they fail codesign ("code object is not signed at all", In subcomponent: Contents/MacOS/._nxnative).
+        for name in ('patched/._main.patched.bin', 'msl/._k.metallib', 'font/._nintendo_ext.ttf', 'pso/._gpu.mtl4a', 'romfs/._marker'):
+            (self.tmp / name).write_bytes(b'appledouble')
+        (self.tmp / 'romfs/.DS_Store').write_bytes(b'finder')
+        self.pack()
+        out = Path(self.args.out)
+        self.assertEqual(list(out.rglob('._*')), [])
+        self.assertEqual(list(out.rglob('.DS_Store')), [])
+        info = plistlib.loads((out / 'Contents/Info.plist').read_bytes())
+        self.assertEqual(info['DMModuleFiles'], ['main.cuts.tsv', 'main.fixups.tsv', 'main.gates.tsv', 'main.obs.tsv', 'main.patched.bin', 'nro.tsv'])
+        self.assertEqual(sorted(p.name for p in (out / 'Contents/Resources/dm/font').iterdir()), ['nintendo_ext.ttf'])
+        self.assertEqual(sorted(p.name for p in (out / 'Contents/Resources/pso').iterdir()), ['archive.tsv', 'gpu.mtl4a', 'prebuilt.tsv', 'rest_pairs.tsv'])
+        self.assert_reused()
+
     def test_output_path_and_optional_inputs_invalidate(self):
         self.pack()
         old = Path(self.args.out); new = old.with_name('Other.app')
@@ -371,7 +387,7 @@ class App(unittest.TestCase):
         (t / 'host.c').write_text(HOST_C)
         subprocess.run(['xcrun', 'clang', '-arch', 'arm64', '-o', t / 'dmhost', t / 'host.c'], check=True)
         for d in ('patched', 'romfs/region_common/audio', 'cache/b-0123456789ab', 'profile', 'font', 'aoc/1', 'bin', 'home'): (t / d).mkdir(parents=True)
-        for n, b in (('main.patched.bin', b'code'), ('main.fixups.tsv', b'f'), ('main.gates.tsv', b'g'), ('main.cuts.tsv', b'c'), ('main.obs.tsv', b'o'), ('main.sites.tsv', b's'), ('build_src.sha256', b'h')):
+        for n, b in (('main.patched.bin', b'code'), ('main.fixups.tsv', b'f'), ('main.gates.tsv', b'g'), ('main.cuts.tsv', b'c'), ('main.obs.tsv', b'o'), ('main.changed.tsv', b'w'), ('main.sites.tsv', b's'), ('build_src.sha256', b'h')):
             (t / 'patched' / n).write_bytes(b)
         (t / 'romfs/region_common/audio/edward.bfsar').write_bytes(b'snd')
         (t / 'cache/b-0123456789ab/k_b.metallib').write_bytes(b'lib'); (t / 'cache/b-0123456789ab/inputs.tsv').write_text('# stamp\n')
@@ -416,7 +432,7 @@ class App(unittest.TestCase):
         self.assertFalse(self.app.with_name(self.app.name + '.partial').exists())
         self.assertEqual(sorted(p.name for p in (c / 'MacOS').iterdir()), ['dmhost', 'nxnative'])
         self.assertEqual(sorted(p.name for p in (c / 'Resources/dm').iterdir()),
-                         ['c1_full.tsv', 'env.txt', 'font', 'launcher.json', 'main.cuts.tsv', 'main.fixups.tsv', 'main.gates.tsv', 'main.obs.tsv', 'main.patched.bin', 'pso_manifest.tsv', 'pso_pairs.tsv',
+                         ['c1_full.tsv', 'env.txt', 'font', 'launcher.json', 'main.changed.tsv', 'main.cuts.tsv', 'main.fixups.tsv', 'main.gates.tsv', 'main.obs.tsv', 'main.patched.bin', 'pso_manifest.tsv', 'pso_pairs.tsv',
                           'shader_map.tsv', 'shader_pairs.tsv'])   # the shader pairs: the pipeline prebuild's, without which hybrid draws have no stand-in
         self.assertEqual([p.name for p in (c / 'Resources/msl').iterdir()], ['b-0123456789ab'])   # the libraries only, not the compile cache
         self.assertEqual(sorted(p.name for p in (c / 'Resources/msl/b-0123456789ab').iterdir()), ['inputs.tsv', 'k_b.json', 'k_b.metallib'])
@@ -444,6 +460,7 @@ class App(unittest.TestCase):
         p = plistlib.loads((self.app / 'Contents/Info.plist').read_bytes())
         self.assertEqual((p['CFBundleExecutable'], p['CFBundleName'], p['CFBundleIdentifier'], p['CFBundleShortVersionString']), ('nxnative', 'Game: Test', 'org.nxnative.01008cf01baac000', '1.0.1'))
         self.assertEqual((p['DMTitleID'], p['DMLanguage'], p['DMRomfsMarker'], p['CFBundleIconFile']), (TID, 'fr', 'region_common/audio/edward.bfsar', 'AppIcon'))
+        self.assertIs(p['LSSupportsGameMode'], False)   # macOS's Game Mode holds the GPU at its lowest clock (frame-rate.md)
         self.assertEqual(p['DMSettings'], [])   # launcher.json's settings, as the saved choices they accept: none here
         self.assertRegex(p['DMCommit'], r'^[0-9a-f]{12}(\+dirty)?$')   # the packing checkout (scripts/bug_report.py, the host's start line)
         self.assertEqual(p['DMChain'], '0123456789ab')   # the chain of the libraries packed (msl/b-<chain>)
